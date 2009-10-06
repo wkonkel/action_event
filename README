@@ -1,0 +1,102 @@
+Preface
+=======
+
+This is a project that is currently used in production environments but isn't "production ready" unless
+you're adventurous.  Consider this as a "sneak peak" rather than a "first release".
+
+Another thing to note... this has gone through many iterations (MySQL backed, memcached backed,
+rabbitMQ, etc).  At some point, I plan on adding back in support for all of these and allowing users
+to choose which queue backend they want, but right now it's tied directly to rabbitmq.
+
+
+Summary
+=======
+
+ActionEvent lets you "do something later".  Many things can be taken out of the front-end flow and
+moved to an asynchronous task, speeding up the overall user experience.  LivingSocial has over a hundred
+event pollers spread out on five machines processing millions of events a day.
+
+ActionEvent allows you to:
+
+  * Queue an event from within a rails application to be processed asynchronously.
+  * Access your full rails environment from event processor.
+  * Process events across any number of physical machines (there is no master process).
+  * Start/stop processors on the fly without interrupting anything (think: cloud computing).
+  * Events support inheritance and a simple before_filter/skip_before_filter chain as well.
+
+Queueing an Event
+=================
+
+You can queue up as many events you want from within a rails application using the "queue_action_event"
+method available on all objects.  This takes an event name and an optional hash of parameters.  The name
+and parameters are serialized and stored as an active record object. You can also prioritize events (default
+priorities are :high, :medium and :low).  Pollers will always look for events from the highest priority
+first, so all :high messages will be processed before a single :medium message is processed.
+
+Queueing examples:
+
+    queue_action_event(:some_event)
+    queue_action_event(:some_event, :people_ids => [1,2,3])
+    queue_action_event(:send_email, :queue => :high)
+
+
+Pollers: Processing an Event
+============================
+
+You need to have one or more "pollers" which will process events as they come in the queue.  Pollers will
+continuously query the database trying to get another event to process.  If it finds one, it will try to
+take "ownership" of the event so that no other pollers will process the event.  If this fails (meaning
+another poller already took the message), it moves on.  If it succeeds and takes ownership of the message,
+it will process the event through the corresponding app/events/*_event.rb class.
+
+If you have multiple pollers (likely), you can start and stop them as a daemon.  Each poller needs a unique
+ID so it can keep track of their PID file and stop and start gracefully.  After processing every message,
+a daemonized poller will check their PID file to see if it matches their current process id.  If it doesn't
+match, the poller will stop gracefully.  This allows you to start up a new poller on updated code without
+waiting for or interrupting an existing poller if it happens to be in the middle of processing a message.
+
+Poller examples:
+
+    ./script/poller
+    ./script/poller -d start
+    ./script/poller --daemon --id=2 start
+    ./script/poller --daemon --id=2 --queues="high medium" start
+    
+
+Example
+=======
+
+$ ./script/generate event HelloWorld
+      exists  db/migrate
+      create  db/migrate/20090207172934_create_action_event_tables.rb
+      create  script/poller
+      create  app/events
+      create  app/events/application_event.rb
+      exists  app/events/
+      create  app/events/hello_world_event.rb
+
+# NOTE: running this migration is only necessary the very first time you create an action_event
+$ rake db:migrate
+==  CreateActionEventTables: migrating ========================================
+-- create_table(:action_event_messages)
+   -> 0.0844s
+-- create_table(:action_event_statuses)
+   -> 0.0359s
+==  CreateActionEventTables: migrated (0.1212s) ===============================
+
+$ cat > app/events/hello_world_event.rb
+      class HelloWorldEvent < ApplicationEvent
+        def process
+          puts "hello #{params[:name]}"
+        end
+      end
+
+$ ./script/runner "queue_action_event('hello_world', :name => 'world')"
+
+$ ./script/poller
+[Sat Feb 07 12:41:43 -0500 2009] Processing queues: high,medium,low
+[Sat Feb 07 12:44:31 -0500 2009] Processing medium:1 ({:name=>"world", :event=>"hello_world"})
+hello world
+[Sat Feb 07 12:44:31 -0500 2009] Finished processing medium:1 ({:name=>"world", :event=>"hello_world"})
+
+Copyright (c) 2009 Warren Konkel, released under the MIT license

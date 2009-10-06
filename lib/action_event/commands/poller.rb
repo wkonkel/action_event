@@ -1,0 +1,237 @@
+require 'fileutils'
+require 'optparse'
+
+module ActionEvent
+  module Commands
+    class Poller
+      def initialize
+        @options = {
+          :id => 1,
+          :queues => %W(high medium low),
+          :command => 'start',
+          :environment => RAILS_ENV,
+          :daemon => false,
+          :max_load_average => 8,
+          :min_instances => 5,
+          :max_instances => 200,
+          :max_adjustment => 5,
+          :min_queue_size => 1000
+        }
+        
+        OptionParser.new do |opts|
+          opts.banner = "Usage: #{$0} [options] <command>"
+          opts.on("-d", "--daemon", "Run as a daemon") { |v| @options[:daemon] = v }
+          opts.on("-i", "--id=N", Integer, "Specify ID used in PID file when running as daemon") { |v| @options[:id] = v }
+          opts.on("-q", "--queues='high medium low'", "Specify queue names in order") { |v| @options[:queues] = v.split(' ') }
+          opts.on("-e", "--environment=development", "Specify which rails environment to run in") { |v| @options[:environment] = v }
+          opts.separator ""
+          opts.separator "Cluster options:"
+          opts.on("-l", "--load-average=8", "Specify what load average to optimize to") { |v| @options[:max_load_average] = v }
+          opts.on("-m", "--min-instances=5", "Specify mimimum number of instances") { |v| @options[:min_instances] = v }
+          opts.on("-x", "--max-instances=200", "Specify maximum number of instances") { |v| @options[:max_instances] = v }
+          opts.on("-a", "--max-adjustment=5", "Specify how many the maximum amount of instances that will be adjusted") { |v| @options[:max_adjustment] = v }
+          opts.on("-s", "--min-queue-size=1000", "Specify how many must be in the queue to adjust instances") { |v| @options[:min_queue_size] = v }
+          opts.separator ""
+          opts.separator "Commands:"
+          opts.separator "    start - starts up the poller"
+          opts.separator "    stop - stops a poller currently running as a daemon"
+          opts.separator "    status - prints the status of the queues"
+          opts.separator ""
+          opts.separator "Examples:"
+          opts.separator "    #{$0} start                       (starts a poller running in the console)"
+          opts.separator "    #{$0} -d -e production start      (starts a poller running as a daemon with ID #1)"
+          opts.separator "    #{$0} --daemon --id=5 start       (starts poller with ID #5)"
+          opts.separator "    #{$0} --daemon --id=5 stop        (stops poller with ID #5)"
+        end.parse!
+
+        @options[:command] = ARGV.pop unless ARGV.empty?
+
+        case
+          when @options[:command] == 'start' && !@options[:daemon] then trap_ctrl_c and load_rails_environment and start_processing_loop
+          when @options[:command] == 'start' && @options[:daemon] then trap_term and start_daemon and load_rails_environment and start_processing_loop and remove_pid
+          when @options[:command] == 'stop' then stop_daemon
+          when @options[:command] == 'cluster' then load_rails_environment and refresh_cluster
+          when @options[:command] == 'status' then load_rails_environment and print_status
+        end
+      end
+
+      def print_status
+        ActionEvent::Message.queue_status(@options[:queues]).to_a.sort { |a,b| a.first <=> b.first }.each do |table,messages_left|
+          log "#{table}:\t\t#{messages_left}"
+        end        
+      end
+      
+      def load_rails_environment
+        ENV['ACTION_EVENT_USE_POLLER_DB'] = 'true'
+        ENV["RAILS_ENV"] = @options[:environment]
+        RAILS_ENV.replace(@options[:environment])
+        log "Loading #{RAILS_ENV} environment..."
+        require "#{RAILS_ROOT}/config/environment"
+        
+        if defined?(NewRelic)
+          NewRelic::Control.instance.instance_eval do
+            @settings['app_name'] = @settings['app_name'] + ' (Poller)'
+          end
+        end
+        
+        true
+      end
+
+      # returns the name of the PID file to use for daemons
+      def pid_filename
+        @pid_filename ||= File.join(RAILS_ROOT, "/log/poller.#{@options[:id]}.pid")
+      end
+
+      # forks from the current process and closes out everything
+      def start_daemon
+        log "Starting daemon ##{@options[:id]}..."
+
+        # some process magic
+        exit if fork                     # Parent exits, child continues.
+        Process.setsid                   # Become session leader.
+        exit if fork                     # Zap session leader. 
+        Dir.chdir "/"                    # Release old working directory.
+        File.umask 0000                  # Ensure sensible umask. Adjust as needed.
+
+        # Free file descriptors and point them somewhere sensible.
+        STDIN.reopen "/dev/null"
+        STDOUT.reopen File.join(RAILS_ROOT, "log/poller.log"), "a"
+        STDERR.reopen STDOUT
+
+        # don't start up until the previous poller is dead
+        while (previous_pid = File.read(pid_filename).to_i rescue nil) do
+          break unless File.exists?("/proc/#{previous_pid}")
+          log "Waiting for previous poller to finish..."
+          Process.kill('TERM', previous_pid) 
+          sleep(5)
+        end
+        
+        # record pid
+        File.open(pid_filename, 'w') { |f| f << Process.pid }
+      end
+
+      def trap_ctrl_c
+        trap("SIGINT") do
+          @stop_processing = true
+          log "Sending stop signal..."
+        end
+      end
+
+      def trap_term
+        trap("SIGTERM") do
+          @stop_processing = true
+          log "Received stop signal..."
+        end
+      end
+
+      def refresh_cluster
+        # gather some current stats
+        current_load = `uptime`.split(' ')[-3..-3][0].to_f
+        current_queue = ActionEvent::Message.queue_status(*@options[:queues]).to_a.map(&:last).sum
+
+        # remove stale pid files
+        current_pids = Dir[File.join(RAILS_ROOT, "log/poller.*.pid")]
+        active_pids, stale_pids = current_pids.partition { |f| (File.read("/proc/#{File.read(f).to_i}/cmdline").include?('poller') rescue false) }
+        stale_pids.each { |f| File.delete(f) }
+
+        # compute adjustment based on current load average and queue size
+        if active_pids.length > 0
+          current_instances = active_pids.length
+          needed_instances = ((current_instances*@options[:max_load_average])/current_load).floor
+
+          if needed_instances > current_instances
+            needed_instances = [needed_instances, current_instances + @options[:max_adjustment]].min
+          elsif needed_instances < current_instances && current_queue > @options[:min_queue_size]
+            needed_instances = [needed_instances, current_instances - @options[:max_adjustment]].max
+          end
+        else
+          current_instances = 0
+          needed_instances = @options[:min_instances]
+        end
+
+        needed_instances = @options[:max_instances] if needed_instances > @options[:max_instances]
+        needed_instances = @options[:min_instances] if needed_instances < @options[:min_instances]
+
+
+        # remove pids if there's too many or spawn new ones if there's not enough
+        if needed_instances < current_instances
+          active_pids.last(current_instances - needed_instances).each { |pid_file| puts "delete #{pid_file}" } #File.delete(pid_file) }
+        elsif needed_instances > current_instances
+          (needed_instances - current_instances).times do
+            next_id = (1..needed_instances).to_a.find { |i| !File.exists?(File.join(RAILS_ROOT, "log/poller.#{i}.pid")) }
+            puts "start at id #{next_id}"
+            # if fork
+            # 
+            # end
+          end
+        end
+      end
+  
+      def should_stop_processing?
+        @stop_processing || (@options[:daemon] && (File.read(pid_filename).to_i rescue 0) != Process.pid)
+      end
+  
+      # finds the already running daemon and stops it...
+      def stop_daemon
+        if previous_pid = File.read(pid_filename).to_i rescue nil
+          log "Sending stop signal to daemon ##{@options[:id]}..."
+          Process.kill('TERM', previous_pid) 
+        end
+      end
+      
+      def remove_pid
+        if Process.pid == (File.read(pid_filename).to_i rescue nil)
+          log "Cleaning up PID file..."
+          FileUtils.rm(pid_filename) 
+        end
+      end
+  
+      # loops until should_stop_processing? set to true... in local mode, this is never set so it will loop forever
+      def start_processing_loop
+        log "Processing queues: #{@options[:queues].join(',')}"
+        next_iteration or sleep(0.5) until should_stop_processing?
+        log "Got signal to stop... exiting."
+      end
+
+      # if we can get a message, process it
+      def next_iteration
+        reload_application if RAILS_ENV == 'development'
+        if message = ActionEvent::Message.try_to_get_next_message(@options[:queues])
+          begin
+            log_text = "#{message[:queue_name]}:#{message[:event]} (#{message[:params].inspect})"
+            log "Processing #{log_text}"
+            "#{message[:event]}_event".camelize.constantize.process(message[:params])
+            log "Finished processing #{log_text}"
+          rescue Exception => e
+            log "Error processing #{log_text}: #{e} #{e.backtrace.join("\n")}"
+          end
+          return true
+        else
+          # return false if we didn't get a message... makes start_processing_loop sleep(1)
+          return false
+        end
+      rescue Exception => e
+        log "Error getting next message (#{e})"
+        ActionEvent::Message.connection.verify! rescue log("Error verifying DB connection... sleeping 5 seconds. (#{$!})") and sleep(5)
+        return true
+      end
+      
+      def reload_application
+        ActionController::Routing::Routes.reload
+        ActionController::Base.view_paths.reload! rescue nil
+        ActionView::Helpers::AssetTagHelper::AssetTag::Cache.clear rescue nil
+
+        ActiveRecord::Base.reset_subclasses
+        ActiveSupport::Dependencies.clear
+        ActiveRecord::Base.clear_reloadable_connections!
+      end
+      
+      def log(message)
+        $stdout.puts "[#{"#{@options[:id]}:#{Process.pid} " if @options[:daemon]}#{Time.now}] #{message}"
+        $stdout.flush
+      end
+    end
+  end
+end
+
+ActionEvent::Commands::Poller.new

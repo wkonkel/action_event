@@ -1,0 +1,4 @@
+#!/usr/bin/env ruby
+require File.dirname(__FILE__) + '/../config/boot'
+$LOAD_PATH << File.expand_path(File.join(File.dirname(__FILE__), '/../vendor/plugins/action_event/lib'))
+require 'action_event/commands/poller'
