@@ -1,6 +1,6 @@
 Gem::Specification.new do |s|
   s.name     = "action_event"
-  s.version  = "0.0.1"
+  s.version  = "0.0.2"
   s.date     = "2009-10-06"
   s.summary  = "A framework for asynchronous message processing in a Rails application."
   s.email    = "wkonkel@gmail.com"
@@ -10,4 +10,5 @@ Gem::Specification.new do |s|
   s.authors  = ["Warren Konkel"]
   s.files    = Dir.glob('**/*') - Dir.glob('test/*.rb')
   s.test_files = Dir.glob('test/*.rb')
+  s.require_paths = ["lib"]
 end
